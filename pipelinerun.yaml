@@ -1,0 +1,15 @@
+apiVersion: tekton.dev/v1
+kind: PipelineRun
+metadata:
+  generateName: deployer-constuctor-
+  namespace: default
+spec:
+  params:
+    - name: workflow-url
+      value: https://raw.githubusercontent.com/rampadc/deployer-constructor/refs/heads/main/workflow.yaml
+  pipelineRef:
+    name: deployer-constructor
+  taskRunTemplate:
+    serviceAccountName: pipeline
+  timeouts:
+    pipeline: 8h0m0s
