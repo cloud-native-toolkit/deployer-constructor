@@ -1,0 +1,209 @@
+apiVersion: tekton.dev/v1
+kind: Pipeline
+metadata:
+  name: deployer-constructor
+  namespace: default
+spec:
+  params:
+    - description: "Direct link (e.g.: raw github URL)"
+      name: workflow-url
+      type: string
+  tasks:
+    - name: deploy-argo-workflow
+      params:
+        - name: SCRIPT
+          value: |-
+            set -x  # Print all commands
+            set -e  # Exit on error
+
+            CONFIGMAP_NAME="deployer-constructor-setup-completed"
+            NAMESPACE="default"
+
+            # Check if the ConfigMap already exists
+            if oc get configmap "$CONFIGMAP_NAME" -n "$NAMESPACE" &>/dev/null; then
+                echo "ConfigMap $CONFIGMAP_NAME already exists. Continuing with pipeline execution."
+                exit 0
+            fi
+
+            echo "ConfigMap $CONFIGMAP_NAME not found. Running script..."
+
+            echo "Creating argo namespace..."
+            oc apply -f - <<EOF
+            apiVersion: v1
+            kind: Namespace
+            metadata:
+              name: argo
+            EOF
+
+            echo "Applying Argo Workflows manifests..."
+            oc apply -n argo -f https://github.com/argoproj/argo-workflows/releases/download/v3.6.4/install.yaml
+
+            echo "Waiting for deployments to be ready..."
+            oc -n argo wait deploy --all --for condition=Available --timeout 2m || {
+              echo "Error: Deployments failed to become ready. Checking pod status..."
+              oc get pods -n argo
+              exit 1
+            }
+
+            echo "Creating argo-workflow route..."
+            oc delete route argo-workflow -n argo --ignore-not-found=True
+            cat << EOF | oc apply -f -
+            kind: Route
+            apiVersion: route.openshift.io/v1
+            metadata:
+              name: argo-workflow
+              namespace: argo
+            spec:
+              to:
+                kind: Service
+                name: argo-server
+                weight: 100
+              port:
+                targetPort: web
+              tls:
+                termination: passthrough
+              wildcardPolicy: None
+            EOF
+
+            echo "Creating SSO secrets..."
+            # Create secrets in both namespaces
+            oc apply -f - <<EOF
+            apiVersion: v1
+            kind: Secret
+            metadata:
+              name: argo-workflows-sso
+              namespace: argo
+            data:
+              client-id: YXJnby13b3JrZmxvd3Mtc3Nv
+              client-secret: TVktU0VDUkVULVNUUklORy1DQU4tQkUtVVVJRA==
+            EOF
+            oc apply -f - <<EOF
+            apiVersion: v1
+            kind: Secret
+            metadata:
+              name: argo-workflows-sso
+              namespace: openshift-gitops
+            data:
+              client-id: YXJnby13b3JrZmxvd3Mtc3Nv
+              client-secret: TVktU0VDUkVULVNUUklORy1DQU4tQkUtVVVJRA==
+            EOF
+
+            echo "Patching Dex deployment..."
+            oc patch deployment openshift-gitops-dex-server -n openshift-gitops --type=strategic --patch '
+            {
+              "spec": {
+                "template": {
+                  "spec": {
+                    "containers": [
+                      {
+                        "name": "dex",
+                        "env": [
+                          {
+                            "name": "ARGO_WORKFLOWS_SSO_CLIENT_SECRET",
+                            "valueFrom": {
+                              "secretKeyRef": {
+                                "name": "argo-workflows-sso",
+                                "key": "client-secret"
+                              }
+                            }
+                          }
+                        ]
+                      }
+                    ]
+                  }
+                }
+              }
+            }'
+
+            echo "Getting cluster domain..."
+            CLUSTER_DOMAIN=$(oc get ingress.config.openshift.io cluster -o jsonpath='{.spec.domain}')
+            if [ -z "$CLUSTER_DOMAIN" ]; then
+              echo "Error: Failed to get cluster domain"
+              exit 1
+            fi
+
+            # Patch the ArgoCD custom resource
+            echo "Patching ArgoCD openshift-gitops CR..."
+            oc patch argocd openshift-gitops -n openshift-gitops --type=merge -p "
+            spec:
+              sso:
+                dex:
+                  config: |
+                    staticClients:
+                    - id: argo-workflows-sso
+                      name: Argo Workflow
+                      secretEnv: ARGO_WORKFLOWS_SSO_CLIENT_SECRET
+                      redirectURIs:
+                        - https://argo-workflow-argo.${CLUSTER_DOMAIN}/oauth2/callback
+                  env:
+                    - name: ARGO_WORKFLOWS_SSO_CLIENT_SECRET
+                      valueFrom:
+                        secretKeyRef:
+                          key: client-secret
+                          name: argo-workflows-sso
+                    - name: ARGO_WORKFLOWS_SSO_CLIENT_ID
+                      valueFrom:
+                        secretKeyRef:
+                          name: argo-workflows-sso
+                          key: client-id
+            "
+
+            echo "Patching Argo Server deployment..."
+            oc patch deployment argo-server -n argo --type=strategic -p '
+            {
+              "spec": {
+                "template": {
+                  "spec": {
+                    "containers": [
+                      {
+                        "name": "argo-server",
+                        "args": ["server", "--auth-mode=sso"]
+                      }
+                    ]
+                  }
+                }
+              }
+            }'
+
+            echo "Waiting for deployments to be ready..."
+            oc -n argo wait deploy --all --for condition=Available --timeout 2m || {
+              echo "Error: Deployments failed to become ready. Checking pod status..."
+              oc get pods -n argo
+              exit 1
+            }
+
+            echo "Patching Argo Workflow Controller configmap..."
+            oc patch configmap workflow-controller-configmap -n argo --type=merge -p "
+            data:
+              sso: |
+                issuer: https://openshift-gitops-server-openshift-gitops.${CLUSTER_DOMAIN}/api/dex
+                clientId:
+                  name: argo-workflows-sso
+                  key: client-id
+                clientSecret:
+                  name: argo-workflows-sso
+                  key: client-secret
+                redirectUrl: https://argo-workflow-argo.${CLUSTER_DOMAIN}/oauth2/callback
+            "
+
+            # Create the ConfigMap to mark script completion
+            oc create configmap "$CONFIGMAP_NAME" -n "$NAMESPACE" --from-literal=script_status=completed
+
+            echo "ConfigMap $CONFIGMAP_NAME created to prevent future setups."
+      taskRef:
+        kind: Task
+        name: ibm-pak-0.3
+    - name: run-workflow
+      params:
+        - name: SCRIPT
+          value: |-
+            WORKFLOW_OUTPUT=$(oc create -f $(params.workflow-url))
+            WORKFLOW_NAME=$(echo "$WORKFLOW_OUTPUT" | awk '{print $1}' | cut -d'/' -f2)
+
+            WORKFLOW_LINK="https://$(oc get route argo-workflow -n argo -o jsonpath='{.spec.host}')/workflows/default/$WORKFLOW_NAME"
+            echo $WORKFLOW_LINK
+      runAfter:
+        - deploy-argo-workflow
+      taskRef:
+        kind: Task
+        name: ibm-pak-0.3
