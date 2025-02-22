@@ -16,6 +16,9 @@ spec:
     - description: Generated Argo Workflow name
       name: workflow-name
       value: $(tasks.output-workflow-name.results.output)
+    - description: Generated Argo Workflow link
+      name: workflow-link
+      value: $(tasks.output-workflow-link.results.output)
     - description: "Result of the Argo Workflow, values: N/A, Succeeded, Failed, Error"
       name: workflow-result
       value: $(tasks.output-workflow-result.results.output)
@@ -217,14 +220,14 @@ spec:
             if [[ "$(params.wait-till-completion)" == "true" ]]; then
               echo "Waiting for workflow to complete"
             else
-              echo -n "$WORKFLOW_NAME," | tee "$(results.output.path)"
+              echo -n "$WORKFLOW_NAME,,$WORKFLOW_LINK" | tee "$(results.output.path)"
             fi
 
             while [[ "$(params.wait-till-completion)" == "true" ]]; do
                 STATUS=$(oc get workflow/"$WORKFLOW_NAME" -n default -o jsonpath='{.status.phase}')
                 if [[ "$STATUS" == "Succeeded" || "$STATUS" == "Failed" || "$STATUS" == "Error" ]]; then
                     echo "Workflow $WORKFLOW_NAME phase: $STATUS"
-                    COMBINED_VAR="$WORKFLOW_NAME,$STATUS"
+                    COMBINED_VAR="$WORKFLOW_NAME,$STATUS,$WORKFLOW_LINK"
                     echo -n "$COMBINED_VAR" | tee "$(results.output.path)"
                     if [[ "$STATUS" == "Succeeded" ]]; then
                         exit 0
@@ -246,9 +249,10 @@ spec:
             OUTPUT="$(tasks.run-workflow.results.output)"
 
             if [[ -n "$OUTPUT" ]]; then
-                IFS=',' read -r WORKFLOW_NAME STATUS <<< "$OUTPUT"
+                IFS=',' read -r WORKFLOW_NAME STATUS WORKFLOW_LINK <<< "$OUTPUT"
                 WORKFLOW_NAME=$(echo "$WORKFLOW_NAME" | tr -d ' ')
                 STATUS=$(echo "$STATUS" | tr -d ' ')
+                WORKFLOW_LINK=$(echo "$WORKFLOW_LINK" | tr -d ' ')
 
                 echo -n $WORKFLOW_NAME | tee $(results.output.path)
             else
@@ -272,11 +276,34 @@ spec:
                   exit 0
             fi
             if [[ -n "$OUTPUT" ]]; then
-                IFS=',' read -r WORKFLOW_NAME STATUS <<< "$OUTPUT"
+                IFS=',' read -r WORKFLOW_NAME STATUS WORKFLOW_LINK <<< "$OUTPUT"
                 WORKFLOW_NAME=$(echo "$WORKFLOW_NAME" | tr -d ' ')
                 STATUS=$(echo "$STATUS" | tr -d ' ')
+                WORKFLOW_LINK=$(echo "$WORKFLOW_LINK" | tr -d ' ')
                 echo -n $STATUS | tee $(results.output.path)
             else
+                exit 1
+            fi
+      runAfter:
+        - run-workflow
+      taskRef:
+        kind: Task
+        name: ibm-pak-0.3
+    - name: output-workflow-link
+      params:
+        - name: SCRIPT
+          value: |
+            OUTPUT="$(tasks.run-workflow.results.output)"
+
+            if [[ -n "$OUTPUT" ]]; then
+                IFS=',' read -r WORKFLOW_NAME STATUS WORKFLOW_LINK <<< "$OUTPUT"
+                WORKFLOW_NAME=$(echo "$WORKFLOW_NAME" | tr -d ' ')
+                STATUS=$(echo "$STATUS" | tr -d ' ')
+                WORKFLOW_LINK=$(echo "$WORKFLOW_LINK" | tr -d ' ')
+
+                echo -n $WORKFLOW_LINK | tee $(results.output.path)
+            else
+                echo "Error: Workflow link is empty."
                 exit 1
             fi
       runAfter:
