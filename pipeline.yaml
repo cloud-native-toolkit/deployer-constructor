@@ -8,6 +8,17 @@ spec:
     - description: "Direct link (e.g.: raw github URL)"
       name: workflow-url
       type: string
+    - default: "true"
+      description: Wait until workflow completed before quiting
+      name: wait-till-completion
+      type: string
+  results:
+    - description: Generated Argo Workflow name
+      name: workflow-name
+      value: $(tasks.output-workflow-name.results.output)
+    - description: "Result of the Argo Workflow, values: N/A, Succeeded, Failed, Error"
+      name: workflow-result
+      value: $(tasks.output-workflow-result.results.output)
   tasks:
     - name: deploy-argo-workflow
       params:
@@ -196,14 +207,80 @@ spec:
     - name: run-workflow
       params:
         - name: SCRIPT
-          value: |-
-            WORKFLOW_OUTPUT=$(oc create -f $(params.workflow-url))
+          value: |
+            WORKFLOW_OUTPUT=$(oc create -f "$(params.workflow-url)")
             WORKFLOW_NAME=$(echo "$WORKFLOW_OUTPUT" | awk '{print $1}' | cut -d'/' -f2)
 
             WORKFLOW_LINK="https://$(oc get route argo-workflow -n argo -o jsonpath='{.spec.host}')/workflows/default/$WORKFLOW_NAME"
-            echo $WORKFLOW_LINK
+            echo "$WORKFLOW_LINK"
+
+            if [[ "$(params.wait-till-completion)" == "true" ]]; then
+              echo "Waiting for workflow to complete"
+            else
+              echo -n "$WORKFLOW_NAME," | tee "$(results.output.path)"
+            fi
+
+            while [[ "$(params.wait-till-completion)" == "true" ]]; do
+                STATUS=$(oc get workflow/"$WORKFLOW_NAME" -n default -o jsonpath='{.status.phase}')
+                if [[ "$STATUS" == "Succeeded" || "$STATUS" == "Failed" || "$STATUS" == "Error" ]]; then
+                    echo "Workflow $WORKFLOW_NAME phase: $STATUS"
+                    COMBINED_VAR="$WORKFLOW_NAME,$STATUS"
+                    echo -n "$COMBINED_VAR" | tee "$(results.output.path)"
+                    if [[ "$STATUS" == "Succeeded" ]]; then
+                        exit 0
+                    else
+                        exit 1
+                    fi
+                fi
+                sleep 5 # Add a sleep to prevent excessive polling.
+            done
       runAfter:
         - deploy-argo-workflow
+      taskRef:
+        kind: Task
+        name: ibm-pak-0.3
+    - name: output-workflow-name
+      params:
+        - name: SCRIPT
+          value: |
+            OUTPUT="$(tasks.run-workflow.results.output)"
+
+            if [[ -n "$OUTPUT" ]]; then
+                IFS=',' read -r WORKFLOW_NAME STATUS <<< "$OUTPUT"
+                WORKFLOW_NAME=$(echo "$WORKFLOW_NAME" | tr -d ' ')
+                STATUS=$(echo "$STATUS" | tr -d ' ')
+
+                echo -n $WORKFLOW_NAME | tee $(results.output.path)
+            else
+                echo "Error: Workflow name is empty."
+                exit 1
+            fi
+      runAfter:
+        - run-workflow
+      taskRef:
+        kind: Task
+        name: ibm-pak-0.3
+    - name: output-workflow-result
+      params:
+        - name: SCRIPT
+          value: |
+            OUTPUT="$(tasks.run-workflow.results.output)"
+
+            if [[ "$(params.wait-till-completion)" != "true" ]]; then
+                  echo "User did not want to wait for workflow to complete."
+                  echo -n "N/A" | tee $(results.output.path)
+                  exit 0
+            fi
+            if [[ -n "$OUTPUT" ]]; then
+                IFS=',' read -r WORKFLOW_NAME STATUS <<< "$OUTPUT"
+                WORKFLOW_NAME=$(echo "$WORKFLOW_NAME" | tr -d ' ')
+                STATUS=$(echo "$STATUS" | tr -d ' ')
+                echo -n $STATUS | tee $(results.output.path)
+            else
+                exit 1
+            fi
+      runAfter:
+        - run-workflow
       taskRef:
         kind: Task
         name: ibm-pak-0.3
